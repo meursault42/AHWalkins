@@ -1,0 +1,511 @@
+---
+title: "Walkin_Analysis"
+author: "Chris Wilson"
+date: "June 19, 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Easy Time Series Forecaster
+
+This notebook exists to cut out all of the data munging (to the extent possible) for doing effective and powerful time series work within R. The script is set up to accept content from SQL but can be easily modified to come from any source R can read. Regardless of the source data, it must be formatted as three columns with a date and a data column and a location/label. Please ensure that your data is in that particular order, eg:
+[date] [data] [location]
+6-1-17   5      Seattle
+7-1-17   8      Portland
+...     ...     etc
+
+Additionally, please be aware of the granularity of your data (ie: hourly/daily/weekly/monthly). Some formats may require additional work to function with this set up. If you are using a non-standard format (quarterly or something), let me know and I'll happily add it to a future version.
+
+## Libraries
+
+There are many libraries under the hood of this program. Ensure you install.packages('x') where x is the missing package.
+
+```{r Libraries, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#supress warnings
+options(warn=-1)
+#set local library
+.libPaths('C:\\Users\\VHAPUGWilsoC2\\r_libby')
+#libraries for reshaping/cleaning
+library(RODBC, quietly = TRUE)
+library(ReporteRs, quietly = TRUE)
+library(magrittr, quietly = TRUE)
+library(reshape2, quietly = TRUE)
+library(tbl2xts)
+#helper library
+library(parallel, quietly = TRUE)
+#libraries for viz
+library(cowplot, quietly = TRUE)
+#libaries for TS work
+library(tidyverse, quietly = TRUE)
+library(glue, quietly = TRUE)
+library(timetk, quietly = TRUE)
+library(tidyquant, quietly = TRUE)
+library(tibbletime, quietly = TRUE)
+library(recipes, quietly = TRUE)
+library(rsample, quietly = TRUE)
+library(yardstick, quietly = TRUE)
+library(prophet, quietly = TRUE)
+library(forecast, quietly = TRUE)
+library(stats, quietly = TRUE)
+library(MLmetrics, quietly = TRUE)
+#turn warnings back on
+options(warn=0)
+```
+
+##Set up
+There are three basic changes to make for this notebook:
+1. The train/test split (ie how much data to feed to the models, and how much to check with)
+2. The number of forecasts you'd like the models to produce
+3. The level of granularity of your data (weeky or daily)
+```{r}
+#train/test split
+train<-0.9
+test <-0.1
+
+#the number of desired forecast periods
+n_forecasts<-42
+
+#the level of granularity of data (select one)
+#granularity<-'week'
+granularity<-'day'
+```
+
+## Data
+Import your data and name it timedata
+### Data cleanup
+This will clean up dates, add a count column, and perform a group by function.
+```{r}
+#drop in some ones
+timedata$ones<-rep(1,nrow(timedata))
+
+#daily data formatting
+timedata$AppointmentDate<-as.Date(timedata$AppointmentDateTime, "%Y-%m-%d")
+
+#daily data formatting with group by (if not done already)
+by_day <- group_by(timedata,AppointmentDate,location)
+by_day <- summarize(by_day, 
+                    count = sum(ones))
+
+
+#group by (if not done already)
+by_week <- group_by(timedata,cy_week,location)
+by_week <- summarize(by_week, 
+                    count = sum(ones))
+
+#weekly data formatting
+by_week$cyweek<-as.Date(by_week$cy_week,format = "%Y_%W")
+
+by_week$cyweek<-as.Date(paste(substr(by_week$cy_week,1,4),
+              substr(by_week$cy_week,6,nchar(by_week$cy_week)),
+              "00",sep = '-'),
+        format = '%Y-%W-%w')
+
+#clean up filter for rogue dates
+by_day<-filter(by_day,AppointmentDate<as.Date('2018-6-1'))
+by_week<-filter(by_week,cyweek<as.Date('2018-6-1',format = '%Y-%M-%d'))
+
+by_week$cy_week<-by_week$cyweek
+by_week$cyweek<-NULL
+
+#Assign clean column names
+colnames(by_day)<-c('ds','location','y')
+colnames(by_week)<-c('ds','location','y')
+```
+
+### Data Transformations
+Various methods require time series data to be in specific formats. This will simply create those for you.
+```{r}
+#List of data frames (for prophet and ML methods)
+loc_list <- unique(by_day$location)
+
+df_list<-list()
+
+df_transformer<-function(level){
+  if(level == 'day'){
+    for(loc in loc_list){
+    sub1<-subset(by_day,location==loc,select=
+                   c('ds','y'))
+    df_list[[loc]]<<-sub1
+}
+  }
+  else if(level == 'week'){
+    for(i in loc_list){
+    sub1<-subset(by_week,location==i,select=
+                   c('ds','y'))
+    sub1$y<-as.double(sub1$y)
+    sub1<- sub1[order(sub1$ds),]
+    df_list[[i]]<<-sub1
+}
+  }
+}
+
+#function call
+df_transformer(level = granularity)
+
+#list of TSs for ARIMA and TBATS
+##helper function assumes week data in yyyy_ww format
+weekxts2ts <- function(xtsdata){
+  start<-c(year(min(index(xtsdata))),week(min(index(xtsdata))))
+  end<-c(year(max(index(xtsdata))),week(max(index(xtsdata))))
+  ts(xtsdata,start=start,end=end,frequency=52)
+}
+
+ts_list<- list()
+
+##with time series data objects, there are often holes in the sets. These need to be plugged to transition to type ts otherwise it will cause errors
+ts_transformer<-function(level){
+  if(level == 'day'){
+    for(i in loc_list){
+          sub<-subset(by_day,location==i,select=c('ds','y'))
+          sub<- sub[order(sub$ds),]
+          
+          zoodata<-zoo(sub[,2]$y,sub[,1]$ds)
+          zooindex<-zoo(0,seq(start(zoodata),end(zoodata),by='day'))
+          zoodata2 <- merge(zoodata,zooindex, all=TRUE)
+          zoodata2$zooindex<-NULL
+          zoodata2<-na.fill(zoodata2, fill = 0)
+          
+          inds <- seq(min(index(zoodata2)), max(index(zoodata2)), by = "day")
+          
+          ts_data <- ts(zoodata2$zoodata,
+               start = c(min(year(index(zoodata2))), as.numeric(format(inds[1], "%j"))),
+               frequency = 365)
+          
+          ts_list[[i]]<<-ts_data
+    }
+  }
+  else if(level == 'week'){
+      for(i in loc_list){
+        sub<-subset(by_week,location==i,select=c('ds','y'))
+      sub<- sub[order(sub$ds),]
+        
+        
+        zoodata<-zoo(sub[,2]$y,sub[,1]$ds)
+        zoodata<-zoo(sub[,2]$y,sub[,1]$ds)
+        zooindex<-zoo(0,seq(start(zoodata),end(zoodata),by='week'))
+        zoodata2 <- merge(zoodata,zooindex, all=TRUE)
+        zoodata2$zooindex<-NULL
+        zoodata2<-na.fill(zoodata2, fill = 0)
+
+        inds <- seq(min(index(zoodata2)), max(index(zoodata2)), by = "week")
+        
+        ts_data <- ts(zoodata2$zoodata,
+             start = c(min(year(index(zoodata2))), as.numeric(format(inds[1], "%U"))),
+             end = c(max(year(index(zoodata2))), as.numeric(format(inds[length(inds)], "%U"))),
+             frequency = 52)
+        
+        ts_list[[i]]<<-ts_data
+    }
+  }
+  else print('no level selected')
+}
+
+##function call
+ts_transformer(level = granularity)
+```
+
+## EDA
+Basic TS EDA comes in a few common formats. We'll start with basic plotting.
+### Basic plot
+```{r basic plot, echo=FALSE}
+baseplot_list<-list()
+for(i in loc_list){
+  x<-ggplot(data = df_list[[i]], aes(x=ds,y=y,color = y)) + 
+    geom_line() +
+    ggtitle(i) + 
+    theme(legend.position="none")
+  baseplot_list[[i]]<-x
+}
+##access the basic plots by looking at items in the list. For example
+##> baseplot_list$itemname
+```
+
+### ACF
+The ACF plot will show you what auto correlation points account for the most variation in the set.
+```{r ACF, echo=FALSE}
+acf_plot_list<-list()
+
+tidy_acf <- function(data, value, lags = 0:20) {
+    value_expr <- enquo(value)
+    
+    acf_values <- data %>%
+        pull(value) %>%
+        acf(lag.max = tail(lags, 1), plot = FALSE) %>%
+        .$acf %>%
+        .[,,1]
+    
+    ret <- tibble(acf = acf_values) %>%
+        rowid_to_column(var = "lag") %>%
+        mutate(lag = lag - 1) %>%
+        filter(lag %in% lags)
+    
+    return(ret)
+}
+
+for(i in loc_list){
+    acfmax<-length(df_list[[i]]$ds)
+    x<-df_list[[i]] %>%
+      tidy_acf('y', lags = 1:acfmax) %>%
+      ggplot(aes(lag, acf, color = acf)) +
+      #scale_color_gradient2(low='#0033FF',high='#FF3300',mid='grey50', limits = c(-.5,.8)) +
+      geom_segment(aes(xend = lag, yend = 0)) +
+      #geom_hline(yintercept = .5, size = .5) +
+      labs(title = paste(i," ACF"))
+    acf_plot_list[[i]]<-x
+}
+##access the acf plots by looking at items in the list
+##acf_plot_list$itemname
+```
+
+### Decomposition
+The decomposition plot below is automatically generated from a best fit approximation from the forecast package. It will attempt to decompose each series in the set into 3 components:
+*trend
+*seasonal 
+*random residuals
+```{r Decomp, echo=FALSE}
+decomp_plot_list<-list()
+for(i in loc_list){
+  #check<-try(ts_list[[i]] %>% decompose,TRUE)
+  #if(isTRUE(class(check)=='try-error')){next}
+  #else{
+    x<-ts_list[[i]] %>% decompose
+    decomp_plot_list[[i]]<-x
+  #}
+}
+##access the decomp plots by plotting items in the list
+##decomp_plot_list$itemname %>% plot()
+```
+
+## TS forecasts
+Each forecast produced will have 3 parts:
+1. The actual forecast, which will be based on the number of periods selected above
+2. The validation MAE, which is how well the model was able to guess the test portion of the set
+3. The forecast plot, which can be accessed via a function call
+
+### ARIMA
+An ARIMA model accounts for simple seasonality plus a trend and forecasts out the decomposed components. It is the bedrock forecast method. This method requires a minimum of two seasons, so anything with less than two full cycles (2 years usually) will be skipped.
+```{r Arima models}
+##holding lists for ARIMA models
+mod_list <- list()
+aa_mae_list<-list()
+ar_plot_list<-list()
+
+##val mae
+
+backtest_aa<-function(ts,test){
+  testlen<-floor(length(ts)*(1-test))
+  aa_train_split<-subset(ts,end=testlen)
+  aa_test<-subset(ts,start=testlen)
+  aa_mod<-auto.arima(aa_train_split)
+  aa_fore<-forecast(aa_mod,h=length(aa_test))
+  mod_mae<-MAE(y_pred = aa_fore$mean, aa_test)
+  return(round(mod_mae,1))
+}
+
+aa_mae_list<-lapply(ts_list,backtest_aa,test)
+
+for(i in loc_list){
+  if(length(ts_list[[i]])>(frequency(ts_list[[i]]*2))){
+  mod_list[[i]] <- auto.arima(ts_list[[i]])
+  print(paste('model for',i,'complete'))#,stepwise = FALSE,approximation = FALSE)
+  }
+}
+
+for (i in loc_list){
+  if(is.null(mod_list[[i]])==FALSE){
+    #assess model accuracy
+    #acc<-accuracy(mod_list[[i]])
+    
+    #assess model uncertainty
+    #temp_fore<-mod_list[[i]] %>% forecast(h=13)
+    #mod_rng<-max(temp_fore$x)-min(temp_fore$x)
+    #fore_rng<-mean(temp_fore$upper[,2]-temp_fore$lower[,2])
+    #fore_uncert<-fore_rng/mod_rng
+    
+    x<-mod_list[[i]] %>% forecast(h=n_forecasts) %>% autoplot() 
+    
+    x <- x + 
+      ggtitle(paste('ARIMA Forecast for',
+                    i,'Validation MAE:',aa_mae_list[[i]])) +
+      ylab('Observations') +
+      xlab(paste('Calendar Year by ',granularity)) +
+      theme_light() +
+      theme(legend.position="none")
+      
+    ar_plot_list[[i]] <- x
+    }
+}
+
+aa_prettyplot<-function(x){
+  return(x + geom_line(aes(x$layers[[1]]$data$datetime,
+                   x$layers[[1]]$data$yvar,
+                   color=x$layers[[1]]$data$yvar)) +
+       scale_colour_gradient(low='#0033FF',high='#FF3300'))
+}
+
+##access forecast plots via the prettyplot function
+##example: aa_prettyplot(ar_plot_list$`Location_Name`)
+```
+
+### Prophet
+The prophet model is an additive model developed by facebook for internal use and was made open source around mid 2017. It does much better than arima on daily forecasts for various reasons. This model is more permissive, but there is a cutoff at 10 observations (ie a set of length less than 10 will be skipped).
+```{r Prophet models}
+##holding lists for prophet models
+pro_models<-list()
+pro_plot_list<-list()
+pro_mae_list<-list()
+
+##validation test run
+backtest_pro<-function(data,test){
+  if(dim(data)[1]>10){
+  mod<-prophet(head(data,floor(dim(data)[1]*(1-test))))
+  trainlen<-floor(dim(data)[1]*(1-test))
+  data_sub<-as.data.frame(data$ds[trainlen:(dim(data)[1])])
+  colnames(data_sub)<-c('ds')
+  pro_fore<-predict(mod,data_sub)
+  mod_mae<-MAE(y_pred = pro_fore$yhat,data$y[trainlen:(dim(data)[2])])
+  return(round(mod_mae,1))
+  }
+}
+
+##function call
+pro_mae_list<-lapply(df_list,backtest_pro,test)
+
+##forecast run
+forecast_pro<-function(data){
+  if(dim(data)[1]>10){
+  pro_mod<-prophet(data)
+  future_df<-make_future_dataframe(pro_mod, n_forecasts, freq = granularity, include_history = FALSE)
+  pro_fore<-predict(pro_mod,future_df)
+  output<-list(pro_mod,pro_fore)
+  return(output)
+  
+  #mod_mae<-MAE(y_pred = pro_fore$yhat,data$y[trainlen:(dim(data)[2])])
+  #return(round(mod_mae,1))
+  }
+}
+
+pro_models <-lapply(df_list,forecast_pro)
+
+# x + geom_line(aes(x$data$ds,
+#                    x$data$y,
+#                    color=x$data$y)) + 
+#   scale_colour_gradient(low='#0033FF',high='#FF3300') +
+#   ggtitle(paste('Prophet Forecast for',
+#                     i,'Validation MAE:',pro_mae_list[[i]])) +
+#       ylab('Observations') +
+#       xlab(paste('Calendar Year by ',granularity)) +
+#       theme_light() +
+#       theme(legend.position="none")
+
+##generates plots
+for (name in names(df_list)){
+  if(is.null(pro_models[[name]])==FALSE){
+ x <- plot(pro_models[[name]][[1]],pro_models[[name]][[2]])
+ x <- x + 
+   ggtitle(paste('Prophet Forecast for',
+                    name,'Validation MAE:',pro_mae_list[[name]])) +
+   xlab(paste('Calendar Year by ',granularity)) +
+   ylab('Observations') +
+   theme_light() +
+   theme(legend.position="none")
+ pro_plot_list[[name]]<- x
+}
+}
+
+pro_prettyplot<-function(x){
+  return(x + geom_line(aes(x = x$data$ds,
+                           y = x$data$y,
+                           color = x$data$y)) +
+       scale_colour_gradient(low='#0033FF',high='#FF3300'))
+}
+##access prophet plot results via the pro_prettyplot function
+##example: pro_prettyplot(pro_plot_list$`Location_Name`)
+```
+
+
+### TBATS
+```{r TBATS models}
+##holding lists for ARIMA models
+tb_mod_list <- list()
+tb_mae_list<-list()
+tb_plot_list<-list()
+
+##val mae
+
+backtest_tb<-function(ts,test){
+  testlen<-floor(length(ts)*(1-test))
+  tb_train_split<-subset(ts,end=testlen)
+  tb_test<-subset(ts,start=testlen)
+  tb_mod<-tbats(tb_train_split) #turn off parallel if it throws errors# ,use.parallel = FALSE)
+  tb_fore<-forecast(tb_mod,h=length(tb_test))
+  mod_mae<-MAE(y_pred = tb_fore$mean, tb_test)
+  return(round(mod_mae,1))
+}
+
+tb_mae_list<-lapply(ts_list,backtest_tb,test)
+
+for(i in loc_list){
+  if(length(ts_list[[i]])>(frequency(ts_list[[i]]*2))){
+  tb_mod_list[[i]] <- tbats(ts_list[[i]]) #turn off parallel if it throws errors# ,use.parallel = FALSE)
+  print(paste('TBATS model for',i,'complete'))#,stepwise = FALSE,approximation = FALSE)
+  }
+}
+
+for (i in loc_list){
+  if(is.null(mod_list[[i]])==FALSE){
+    #assess model accuracy
+    #acc<-accuracy(mod_list[[i]])
+    
+    #assess model uncertainty
+    #temp_fore<-mod_list[[i]] %>% forecast(h=13)
+    #mod_rng<-max(temp_fore$x)-min(temp_fore$x)
+    #fore_rng<-mean(temp_fore$upper[,2]-temp_fore$lower[,2])
+    #fore_uncert<-fore_rng/mod_rng
+    
+    x<-tb_mod_list[[i]] %>% forecast(h=n_forecasts) %>% autoplot() 
+    
+    x <- x + 
+      ggtitle(paste('TBATS Forecast for',
+                    i,'Validation MAE:',tb_mae_list[[i]])) +
+      ylab('Observations') +
+      xlab(paste('Calendar Year by ',granularity)) +
+      theme_light() +
+      theme(legend.position="none")
+      
+    tb_plot_list[[i]] <- x
+    }
+}
+
+##access forecast plots via the prettyplot function
+##example: aa_prettyplot(tb_plot_list$`Location_Name`)
+```
+
+## Results Comparison
+This section will display the plots from all three models for the selected faceting criteria.
+```{r}
+comp_plot<-function(loc){
+  x<-plot_grid(aa_prettyplot(ar_plot_list[[loc]]),
+          aa_prettyplot(tb_plot_list[[loc]]),
+          pro_prettyplot(pro_plot_list[[loc]]), 
+          ncol = 1, nrow = 3)
+  return(x)
+}
+
+##access comparitive results via the comp_plot function
+##example: comp_plot(loc = 'Location_Name')
+```
+
+## Test average of estimates?
+```{r}
+
+aa<-mod_list[['Location_Name']] %>% forecast(h=n_forecasts)
+tb<-tb_mod_list[['Location_Name']] %>% forecast(h=n_forecasts)
+
+pro_mod<-prophet(df_list$`Location_Name`)
+future_df<-make_future_dataframe(pro_mod, n_forecasts, freq = granularity, include_history = FALSE)
+pro_fore<-predict(pro_mod,future_df)
+
+plot((aa$mean+tb$mean+pro_fore$yhat)/3)
+```
